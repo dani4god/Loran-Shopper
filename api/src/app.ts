@@ -792,7 +792,25 @@ app.post("/v1/banks/resolve", ...shopper, async (req, res) => {
   });
 });
 app.post("/v1/me/settings/request", ...shopper, async (req, res) => {
-  const input = settingsInput.parse(req.body);
+  const input = settingsInput
+  .extend({
+    markets: z
+      .array(z.string().trim().min(1).max(120))
+      .min(1, "Enter at least one market.")
+      .max(40, "You can enter up to 40 markets.")
+      .transform((markets) => {
+        const seen = new Set<string>();
+
+        return markets.filter((market) => {
+          const normalized = market.toLowerCase();
+          if (seen.has(normalized)) return false;
+          seen.add(normalized);
+          return true;
+        });
+      })
+      .optional(),
+  })
+  .parse(req.body);
   const a = await Account.findById(req.actor!.id);
   if (
     a!.otp?.expiresAt &&

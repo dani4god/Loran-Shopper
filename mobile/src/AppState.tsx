@@ -28,11 +28,15 @@ import {
   API,
   api,
   clearSession,
+  getSessionVersion,
+  hasSavedSession,
   naira,
+  onSessionExpired,
   recentOrders,
   rememberOrder,
   restoreSession,
   saveSession,
+  SessionExpiredError,
   statusLabel,
   toKobo,
   upload,
@@ -68,6 +72,14 @@ const labels = [
   "Fruit & household goods",
 ];
 
+const emptyEarnings = {
+  orders: 0,
+  settlementTotal: 0,
+  shoppingEarnings: 0,
+  cleared: 0,
+  pending: 0,
+};
+
 function paymentLog(
   message: string,
   details?: Record<string, unknown>,
@@ -77,6 +89,37 @@ function paymentLog(
   }
 }
 
+function parseMarkets(value: string): string[] {
+  const seen = new Set<string>();
+
+  const markets = value
+    .split(",")
+    .map((market) => market.trim())
+    .filter((market) => {
+      if (!market) return false;
+
+      const normalized = market.toLowerCase();
+      if (seen.has(normalized)) return false;
+
+      seen.add(normalized);
+      return true;
+    });
+
+  if (!markets.length) {
+    throw new Error("Enter at least one market you cover.");
+  }
+  if (markets.length > 40) {
+    throw new Error("You can enter up to 40 markets.");
+  }
+  if (markets.some((market) => market.length > 120)) {
+    throw new Error(
+      "Each market name must be 120 characters or fewer.",
+    );
+  }
+
+  return markets;
+}
+
 function Carousel() {
   const width = Dimensions.get("window").width - 44;
   const ref = useRef<ScrollView>(null);
@@ -84,19 +127,13 @@ function Carousel() {
 
   useEffect(() => {
     const timer = setInterval(() => {
-      setIndex(
-        (previous) => (previous + 1) % marketImages.length,
-      );
+      setIndex((previous) => (previous + 1) % marketImages.length);
     }, 3500);
-
     return () => clearInterval(timer);
   }, []);
 
   useEffect(() => {
-    ref.current?.scrollTo({
-      x: index * width,
-      animated: true,
-    });
+    ref.current?.scrollTo({ x: index * width, animated: true });
   }, [index, width]);
 
   return (
@@ -108,9 +145,7 @@ function Carousel() {
         showsHorizontalScrollIndicator={false}
         onMomentumScrollEnd={(event) =>
           setIndex(
-            Math.round(
-              event.nativeEvent.contentOffset.x / width,
-            ),
+            Math.round(event.nativeEvent.contentOffset.x / width),
           )
         }
       >
@@ -118,14 +153,8 @@ function Carousel() {
           <View key={i} style={{ width }}>
             <Image
               source={image}
-              accessibilityLabel={
-                labels[i] + " market illustration"
-              }
-              style={{
-                width,
-                height: 205,
-                borderRadius: 20,
-              }}
+              accessibilityLabel={labels[i] + " market illustration"}
+              style={{ width, height: 205, borderRadius: 20 }}
             />
             <Text style={[s.small, { marginTop: 8 }]}>
               {labels[i]} · Illustrative market scene
@@ -146,19 +175,18 @@ export function AppStateProvider({
   children: React.ReactNode;
 }) {
   const pathname = usePathname();
-
   const screen = (
     pathname === "/" ? "home" : pathname.slice(1)
   ) as Screen;
 
+  const [sessionReady, setSessionReady] = useState(false);
   const [hasSession, setHasSession] = useState(false);
   const [forgot, setForgot] = useState(false);
   const [resetCode, setResetCode] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
-  const [selected, setSelected] =
-    useState<Shopper | null>(null);
+  const [selected, setSelected] = useState<Shopper | null>(null);
   const [key, setKey] = useState("");
   const [order, setOrder] = useState<Order | null>(null);
   const [me, setMe] = useState<Shopper | null>(null);
@@ -166,7 +194,6 @@ export function AppStateProvider({
   const [shoppers, setShoppers] = useState<Shopper[]>([]);
   const [page, setPage] = useState(1);
   const [total, setTotal] = useState(0);
-
   const [myOrders, setMyOrders] = useState<Order[]>([]);
   const [myPage, setMyPage] = useState(1);
   const [myTotal, setMyTotal] = useState(0);
@@ -194,14 +221,7 @@ export function AppStateProvider({
       unit: string;
       price: string;
     }[]
-  >([
-    {
-      name: "",
-      quantity: "1",
-      unit: "item",
-      price: "",
-    },
-  ]);
+  >([{ name: "", quantity: "1", unit: "item", price: "" }]);
 
   const [market, setMarket] = useState("");
   const [notes, setNotes] = useState("");
@@ -209,20 +229,11 @@ export function AppStateProvider({
   const [transport, setTransport] = useState("");
   const [fee, setFee] = useState("");
   const [reason, setReason] = useState("");
-
   const [complaint, setComplaint] = useState({
     subject: "",
     message: "",
   });
-
-  const [earnings, setEarnings] = useState({
-    orders: 0,
-    settlementTotal: 0,
-    shoppingEarnings: 0,
-    cleared: 0,
-    pending: 0,
-  });
-
+  const [earnings, setEarnings] = useState(emptyEarnings);
   const [tab, setTab] = useState("Orders");
 
   const [reg, setReg] = useState({
@@ -248,7 +259,6 @@ export function AppStateProvider({
 
   const [states, setStates] = useState<string[]>([]);
   const [showStates, setShowStates] = useState(false);
-
   const [banks, setBanks] = useState<
     { name: string; code: string }[]
   >([]);
@@ -258,122 +268,85 @@ export function AppStateProvider({
   const [accountNumber, setAccountNumber] = useState("");
   const [accountName, setAccountName] = useState("");
   const [settingsFee, setSettingsFee] = useState("");
+  const [settingsMarkets, setSettingsMarkets] = useState("");
   const [newPhoto, setNewPhoto] = useState("");
   const [otp, setOtp] = useState("");
   const [otpSent, setOtpSent] = useState(false);
 
-  function setScreen(next: Screen) {
-    if (next === screen) return;
+  const protectedScreen =
+    screen === "dashboard" ||
+    screen === "shopperOrder" ||
+    screen === "settings";
 
-    const path = (
-      next === "home" ? "/" : "/" + next
-    ) as Href;
-
-    if (next === "home") {
-      router.replace(path);
-    } else {
-      router.push(path);
-    }
-  }
-
-  async function run(task: () => Promise<void>) {
-    setBusy(true);
-    setError("");
-
-    try {
-      await task();
-    } catch (error) {
-      setError(
-        error instanceof Error
-          ? error.message
-          : "Something went wrong.",
-      );
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  function go(next: Screen) {
-    setScreen(next);
-    setError("");
-    setReason("");
-  }
-
-  async function dashboard(p = myPage) {
-    const [user, orders, news, platform, totals] =
-      await Promise.all([
-        api<Shopper>("/me"),
-        api<{ records: Order[]; total: number }>(
-          `/me/orders?page=${p}`,
-        ),
-        api<typeof announcements>("/announcements"),
-        api<{ platformFee: number }>("/me/platform"),
-        api<typeof earnings>("/me/earnings"),
-      ]);
-
-    setMe(user);
-    setMyOrders(orders.records);
-    setMyTotal(orders.total);
-    setMyPage(p);
-    setAnnouncements(news);
-    setPlatformFee(platform.platformFee);
-    setEarnings(totals);
-
-    go("dashboard");
-  }
-
-  async function list(p = 1) {
-    const data = await api<{
-      records: Shopper[];
-      total: number;
-    }>(`/shoppers?page=${p}`);
-
-    setShoppers(data.records);
-    setTotal(data.total);
-    setPage(p);
-
-    go("shoppers");
-  }
-
-  async function track(value = key) {
-    const normalizedKey = value.trim().toUpperCase();
-
-    const data = await api<Order>(
-      "/order",
-      "GET",
-      undefined,
-      normalizedKey,
-    );
-
-    setKey(normalizedKey);
-    setOrder(data);
-
-    await rememberOrder(normalizedKey);
-    setRecent(await recentOrders());
-
-    go("track");
-  }
-
-  const refreshTracked = useCallback(async () => {
-    setOrder(
-      await api<Order>(
-        "/order",
-        "GET",
-        undefined,
-        key,
-      ),
-    );
-  }, [key]);
+  const clearShopperState = useCallback(() => {
+    setHasSession(false);
+    setMe(null);
+    setMyOrders([]);
+    setMyPage(1);
+    setMyTotal(0);
+    setAnnouncements([]);
+    setPlatformFee(0);
+    setEarnings({ ...emptyEarnings });
+    setPassword("");
+    setResetCode("");
+    setForgot(false);
+    setBankCode("");
+    setBankSearch("");
+    setAccountNumber("");
+    setAccountName("");
+    setSettingsFee("");
+    setSettingsMarkets("");
+    setNewPhoto("");
+    setOtp("");
+    setOtpSent(false);
+    setTab("Orders");
+  }, []);
 
   useEffect(() => {
+    return onSessionExpired(() => {
+      clearShopperState();
+      setOrder(null);
+      setPrices([]);
+      setTransport("");
+      setFee("");
+      setBusy(false);
+      setError("Your session expired. Please sign in again.");
+      router.replace("/login");
+    });
+  }, [clearShopperState]);
+
+  useEffect(() => {
+    let active = true;
+
     void recentOrders()
-      .then(setRecent)
-      .catch(() => setRecent([]));
+      .then((values) => {
+        if (active) setRecent(values);
+      })
+      .catch(() => {
+        if (active) setRecent([]);
+      });
 
     void restoreSession()
-      .then(setHasSession)
-      .catch(() => setHasSession(false));
+      .then((restored) => {
+        if (active) setHasSession(restored);
+      })
+      .catch(() => {
+        if (active) setHasSession(false);
+      })
+      .finally(() => {
+        if (active) setSessionReady(true);
+      });
+
+    return () => {
+      active = false;
+    };
   }, []);
+
+  useEffect(() => {
+    if (sessionReady && protectedScreen && !hasSession) {
+      router.replace("/login");
+    }
+  }, [sessionReady, protectedScreen, hasSession]);
 
   useEffect(() => {
     if (__DEV__) {
@@ -386,14 +359,123 @@ export function AppStateProvider({
     const subscription = NativeAppState.addEventListener(
       "change",
       (state) => {
-        if (__DEV__) {
-          console.log("[APP LIFECYCLE]", state);
-        }
+        if (__DEV__) console.log("[APP LIFECYCLE]", state);
       },
     );
 
     return () => subscription.remove();
   }, []);
+
+  function setScreen(next: Screen) {
+    if (next === screen) return;
+
+    const path = (
+      next === "home" ? "/" : "/" + next
+    ) as Href;
+
+    if (next === "home" || next === "login") {
+      router.replace(path);
+    } else {
+      router.push(path);
+    }
+  }
+
+  function go(next: Screen) {
+    setError("");
+    setReason("");
+    setScreen(next);
+  }
+
+  async function run(task: () => Promise<void>) {
+    setBusy(true);
+    setError("");
+
+    try {
+      await task();
+    } catch (caught) {
+      if (caught instanceof SessionExpiredError) {
+        clearShopperState();
+        setError("Your session expired. Please sign in again.");
+        router.replace("/login");
+        return;
+      }
+
+      setError(
+        caught instanceof Error
+          ? caught.message
+          : "Something went wrong.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function dashboard(p = myPage) {
+    if (!hasSavedSession()) throw new SessionExpiredError();
+
+    const version = getSessionVersion();
+
+    const [user, orders, news, platform, totals] =
+      await Promise.all([
+        api<Shopper>("/me"),
+        api<{ records: Order[]; total: number }>(
+          `/me/orders?page=${p}`,
+        ),
+        api<typeof announcements>("/announcements"),
+        api<{ platformFee: number }>("/me/platform"),
+        api<typeof earnings>("/me/earnings"),
+      ]);
+
+    if (
+      version !== getSessionVersion() ||
+      !hasSavedSession()
+    ) return;
+
+    setHasSession(true);
+    setMe(user);
+    setMyOrders(orders.records);
+    setMyTotal(orders.total);
+    setMyPage(p);
+    setAnnouncements(news);
+    setPlatformFee(platform.platformFee);
+    setEarnings(totals);
+    go("dashboard");
+  }
+
+  async function list(p = 1) {
+    const data = await api<{
+      records: Shopper[];
+      total: number;
+    }>(`/shoppers?page=${p}`);
+
+    setShoppers(data.records);
+    setTotal(data.total);
+    setPage(p);
+    go("shoppers");
+  }
+
+  async function track(value = key) {
+    const normalizedKey = value.trim().toUpperCase();
+
+    if (!normalizedKey) throw new Error("Enter your order ID.");
+
+    const data = await api<Order>(
+      "/order", "GET", undefined, normalizedKey,
+    );
+
+    setKey(normalizedKey);
+    setOrder(data);
+    await rememberOrder(normalizedKey);
+    setRecent(await recentOrders());
+    go("track");
+  }
+
+  const refreshTracked = useCallback(async () => {
+    if (!key.trim()) return;
+    setOrder(
+      await api<Order>("/order", "GET", undefined, key),
+    );
+  }, [key]);
 
   useEffect(() => {
     if (screen !== "track") return;
@@ -412,9 +494,7 @@ export function AppStateProvider({
   ) {
     setItems((previous) =>
       previous.map((item, i) =>
-        i === index
-          ? { ...item, [field]: value }
-          : item,
+        i === index ? { ...item, [field]: value } : item,
       ),
     );
   }
@@ -429,32 +509,28 @@ export function AppStateProvider({
       );
     }
 
-    const result =
-      await ImagePicker.launchImageLibraryAsync({
-        mediaTypes: ["images"],
-        quality: 0.8,
-        allowsEditing: true,
-        aspect: [1, 1],
-      });
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ["images"],
+      quality: 0.8,
+      allowsEditing: true,
+      aspect: [1, 1],
+    });
 
     if (result.canceled) return;
 
     const image = result.assets[0];
-
     if (!image?.uri) {
-      throw new Error(
-        "No photo was selected. Please select your picture again.",
-      );
+      throw new Error("Please select your picture again.");
     }
 
-    const fileId = await upload(
-      image.uri,
-      image.fileName || "profile.jpg",
-      image.mimeType || "image/jpeg",
-      "photo",
+    callback(
+      await upload(
+        image.uri,
+        image.fileName || "profile.jpg",
+        image.mimeType || "image/jpeg",
+        "photo",
+      ),
     );
-
-    callback(fileId);
   }
 
   async function identity() {
@@ -467,21 +543,17 @@ export function AppStateProvider({
       );
     }
 
-    const result =
-      await ImagePicker.launchImageLibraryAsync({
-        mediaTypes: ["images"],
-        quality: 0.8,
-        allowsEditing: false,
-      });
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ["images"],
+      quality: 0.8,
+      allowsEditing: false,
+    });
 
     if (result.canceled) return;
 
     const image = result.assets[0];
-
     if (!image?.uri) {
-      throw new Error(
-        "Please select a clear image of your ID.",
-      );
+      throw new Error("Please select a clear image of your ID.");
     }
 
     const fileId = await upload(
@@ -502,7 +574,7 @@ export function AppStateProvider({
     let stage = "Starting";
 
     try {
-      paymentLog("1. Payment button pressed", {
+      paymentLog("Payment button pressed", {
         status: order?.status,
         hasOrderKey: Boolean(key),
       });
@@ -514,50 +586,32 @@ export function AppStateProvider({
       }
 
       stage = "Requesting checkout";
-      paymentLog("2. Requesting checkout from API");
 
       const data = await api<{ url: string }>(
-        "/order/pay",
-        "POST",
-        {},
-        key,
+        "/order/pay", "POST", {}, key,
       );
 
-      paymentLog("3. Checkout response received", {
-        hasUrl:
-          typeof data.url === "string" &&
-          data.url.length > 0,
+      paymentLog("Checkout response received", {
+        hasUrl: typeof data.url === "string" && !!data.url,
         elapsedMs: Date.now() - startedAt,
       });
 
       stage = "Validating checkout URL";
 
       if (typeof data.url !== "string" || !data.url) {
-        throw new Error(
-          "The server returned no payment URL.",
-        );
+        throw new Error("The server returned no payment URL.");
       }
 
       const checkoutUrl = new URL(data.url);
-
       if (checkoutUrl.protocol !== "https:") {
-        throw new Error(
-          "The checkout URL must use HTTPS.",
-        );
+        throw new Error("The checkout URL must use HTTPS.");
       }
 
-      paymentLog("4. Checkout URL validated", {
+      paymentLog("Checkout URL validated", {
         host: checkoutUrl.hostname,
       });
 
       stage = "Opening checkout browser";
-
-      paymentLog("5. Opening checkout", {
-        browser:
-          Platform.OS === "android"
-            ? "com.android.chrome"
-            : "system browser",
-      });
 
       const result = await WebBrowser.openBrowserAsync(
         data.url,
@@ -566,22 +620,17 @@ export function AppStateProvider({
           : {},
       );
 
-      paymentLog("6. Browser launch returned", {
+      paymentLog("Browser launch returned", {
         type: result.type,
       });
-
-      // Browser launch does not confirm payment.
-      // The customer returns and taps Check payment.
-    } catch (error) {
-      if (__DEV__) {
-        console.error("[PAYMENT] Failed", {
-          stage,
-          message:
-            error instanceof Error
-              ? error.message
-              : String(error),
-        });
-      }
+    } catch (caught) {
+      paymentLog("Checkout failed", {
+        stage,
+        message:
+          caught instanceof Error
+            ? caught.message
+            : String(caught),
+      });
 
       if (
         stage === "Opening checkout browser" &&
@@ -592,83 +641,92 @@ export function AppStateProvider({
         );
       }
 
-      throw error;
+      throw caught;
     }
   }
 
   async function checkPayment() {
-    try {
-      paymentLog("7. Checking payment with API");
+    paymentLog("Checking payment with API");
 
-      const result = await api<{ paid: boolean }>(
-        "/order/verify-payment",
-        "POST",
-        {},
-        key,
-      );
+    const result = await api<{ paid: boolean }>(
+      "/order/verify-payment", "POST", {}, key,
+    );
 
-      paymentLog("8. Verification returned", {
-        paid: result.paid,
-      });
+    await refreshTracked();
+    paymentLog("Payment verification returned", {
+      paid: result.paid,
+    });
 
-      await refreshTracked();
-      paymentLog("9. Order refreshed");
+    Alert.alert(
+      result.paid
+        ? "Payment confirmed"
+        : "Payment not confirmed yet",
+      result.paid
+        ? "Your payment has been verified successfully."
+        : "If you completed payment, wait briefly and check again. Do not pay again yet.",
+    );
+  }
 
-      Alert.alert(
-        result.paid
-          ? "Payment confirmed"
-          : "Payment not confirmed yet",
-        result.paid
-          ? "Your payment has been verified successfully."
-          : "If you completed payment, wait briefly and check again. Do not pay again yet.",
-      );
-    } catch (error) {
-      if (__DEV__) {
-        console.error("[PAYMENT] Verification failed", {
-          message:
-            error instanceof Error
-              ? error.message
-              : String(error),
-        });
-      }
-
-      throw error;
-    }
+  function invalidateSettingsCode() {
+    setOtpSent(false);
+    setOtp("");
   }
 
   async function settings() {
     if (!me) return;
 
     setSettingsFee(String(me.shoppingFee / 100));
+    setSettingsMarkets(me.markets.join(", "));
     setNewPhoto("");
-    setOtpSent(false);
-    setOtp("");
+    invalidateSettingsCode();
     setBankCode("");
     setBankSearch("");
     setAccountNumber("");
     setAccountName("");
 
     go("settings");
+    setBanks(await api<typeof banks>("/banks"));
+  }
 
+  async function requestSettingsCode() {
+    const markets = parseMarkets(settingsMarkets);
+
+    await api("/me/settings/request", "POST", {
+      shoppingFee: toKobo(settingsFee),
+      markets,
+      ...(newPhoto ? { profilePhoto: newPhoto } : {}),
+      ...(bankCode ? { bankCode, accountNumber } : {}),
+    });
+
+    setOtp("");
+    setOtpSent(true);
+
+    Alert.alert(
+      "Check your email",
+      "Enter the confirmation code to save your markets and other requested changes. If you edit the form again, request a new code.",
+    );
+  }
+
+  async function logout() {
     try {
-      setBanks(await api<typeof banks>("/banks"));
-    } catch (error) {
-      setError(
-        error instanceof Error
-          ? error.message
-          : "Banks unavailable.",
-      );
+      await api("/logout", "POST", {});
+    } catch {
+      // Allow local logout even when the API cannot be reached.
+    } finally {
+      try {
+        await clearSession();
+      } finally {
+        clearShopperState();
+        setOrder(null);
+        go("home");
+      }
     }
   }
 
   function back() {
     setError("");
-
-    if (router.canGoBack()) {
-      router.back();
-    } else {
-      router.replace("/");
-    }
+    if (router.canGoBack()) router.back();
+    else router.replace("/");
   }
 
   return (
@@ -677,22 +735,15 @@ export function AppStateProvider({
         <SafeAreaView style={s.screen}>
           <KeyboardAvoidingView
             style={{ flex: 1 }}
-            behavior={
-              Platform.OS === "ios"
-                ? "padding"
-                : undefined
-            }
+            behavior={Platform.OS === "ios" ? "padding" : undefined}
           >
             <View style={s.header}>
               <Pressable onPress={() => go("home")}>
                 <Text style={s.brand}>
                   loRan{" "}
-                  <Text style={{ color: c.orange }}>
-                    Shopper
-                  </Text>
+                  <Text style={{ color: c.orange }}>Shopper</Text>
                 </Text>
               </Pressable>
-
               {screen !== "home" && (
                 <Pressable onPress={back}>
                   <Text style={s.link}>Back</Text>
@@ -704,16 +755,13 @@ export function AppStateProvider({
               keyboardShouldPersistTaps="handled"
               contentContainerStyle={s.content}
             >
-              {error !== "" && (
-                <Text
-                  accessibilityRole="alert"
-                  style={s.error}
-                >
+              {!!error && (
+                <Text accessibilityRole="alert" style={s.error}>
                   {error}
                 </Text>
               )}
 
-              {busy && (
+              {(busy || !sessionReady) && (
                 <ActivityIndicator color={c.green} />
               )}
 
@@ -722,25 +770,18 @@ export function AppStateProvider({
                   <Text style={s.badge}>
                     LOCAL MARKETS. LESS HASSLE.
                   </Text>
-
                   <Text style={s.h1}>
                     Your market trip,
-                    <Text style={{ color: c.orange }}>
-                      {" "}handled.
-                    </Text>
+                    <Text style={{ color: c.orange }}> handled.</Text>
                   </Text>
-
-                  <Text
-                    style={[s.text, { marginBottom: 20 }]}
-                  >
-                    Meet local shoppers who buy from Nigerian
-                    markets and deliver to your doorstep.
-                    Choose a shopper, send your list and
-                    approve a clear quote before you pay.
+                  <Text style={[s.text, { marginBottom: 20 }]}>
+                    Meet local shoppers who buy from Nigerian markets
+                    and deliver to your doorstep. Choose a shopper,
+                    send your list and approve a clear quote before
+                    you pay.
                   </Text>
 
                   <Carousel />
-
                   <HowItWorks />
 
                   <Button
@@ -750,34 +791,26 @@ export function AppStateProvider({
                   />
 
                   <Card>
-                    <Text style={s.h2}>
-                      Track your order
-                    </Text>
-
+                    <Text style={s.h2}>Track your order</Text>
                     <Text style={s.small}>
                       Your private order ID opens your order.
                       Keep it safe.
                     </Text>
-
                     <Field
                       label="Order ID"
                       value={key}
                       onChangeText={setKey}
                       autoCapitalize="characters"
                     />
-
                     <Button
                       title="Open my order"
-                      disabled={busy || !key}
+                      disabled={busy || !key.trim()}
                       onPress={() => run(() => track())}
                     />
-
                     {recent.map((value) => (
                       <Pressable
                         key={value}
-                        onPress={() =>
-                          run(() => track(value))
-                        }
+                        onPress={() => run(() => track(value))}
                       >
                         <Text style={s.link}>
                           Recent: {value.slice(0, 15)}…
@@ -787,30 +820,22 @@ export function AppStateProvider({
                   </Card>
 
                   <Card>
-                    <Text style={s.h2}>
-                      Know your local markets?
-                    </Text>
-
+                    <Text style={s.h2}>Know your local markets?</Text>
                     <Text style={s.text}>
-                      Help customers shop nearby and earn a
-                      shopping fee. Owning a business or a
-                      vehicle is optional.
+                      Help customers shop nearby and earn a shopping
+                      fee. Owning a business or a vehicle is optional.
                     </Text>
-
                     <Button
                       title="Apply as a shopper"
                       secondary
                       disabled={busy}
                       onPress={() =>
                         run(async () => {
-                          setStates(
-                            await api<string[]>("/states"),
-                          );
+                          setStates(await api<string[]>("/states"));
                           go("register");
                         })
                       }
                     />
-
                     <Button
                       title={
                         hasSession
@@ -818,7 +843,7 @@ export function AppStateProvider({
                           : "Shopper login"
                       }
                       secondary
-                      disabled={busy}
+                      disabled={busy || !sessionReady}
                       onPress={() =>
                         hasSession
                           ? run(() => dashboard())
@@ -827,9 +852,7 @@ export function AppStateProvider({
                     />
                   </Card>
 
-                  <Pressable
-                    onPress={() => go("terms")}
-                  >
+                  <Pressable onPress={() => go("terms")}>
                     <Text style={s.link}>
                       Terms, complaints & privacy
                     </Text>
@@ -839,13 +862,10 @@ export function AppStateProvider({
 
               {screen === "shoppers" && (
                 <>
-                  <Text style={s.h1}>
-                    Available shoppers
-                  </Text>
-
+                  <Text style={s.h1}>Available shoppers</Text>
                   <Text style={s.text}>
-                    Only approved shoppers who are currently
-                    available appear here.
+                    Only approved shoppers who are currently available
+                    appear here.
                   </Text>
 
                   {shoppers.map((shopper) => (
@@ -853,47 +873,33 @@ export function AppStateProvider({
                       <View style={s.row}>
                         <Image
                           source={{
-                            uri:
-                              API +
-                              "/v1/photos/" +
-                              shopper.profilePhoto,
+                            uri: `${API}/v1/photos/${shopper.profilePhoto}`,
                           }}
                           style={s.photo}
                         />
-
                         <View style={{ flex: 1 }}>
                           <Text style={s.h3}>
-                            {shopper.firstName}{" "}
-                            {shopper.surname}
+                            {shopper.firstName} {shopper.surname}
                           </Text>
-                          <Text style={s.small}>
-                            {shopper.state}
-                          </Text>
+                          <Text style={s.small}>{shopper.state}</Text>
                         </View>
                       </View>
 
                       <Text style={s.text}>
                         {shopper.markets.join(" · ")}
                       </Text>
-
-                      <Text style={s.small}>
-                        Shopping price
-                      </Text>
-
+                      <Text style={s.small}>Shopping price</Text>
                       <Text style={s.price}>
                         {naira(shopper.shoppingFee)}
                       </Text>
-
                       <Text style={s.small}>
-                        Items and transport are quoted
-                        separately.
+                        Items and transport are quoted separately.
                       </Text>
-
                       <Button
                         title="Choose this shopper"
                         onPress={() => {
                           setSelected(shopper);
-                          setMarket(shopper.markets[0]);
+                          setMarket(shopper.markets[0] || "");
                           go("create");
                         }}
                       />
@@ -912,20 +918,14 @@ export function AppStateProvider({
                       title="Previous"
                       secondary
                       disabled={page === 1 || busy}
-                      onPress={() =>
-                        run(() => list(page - 1))
-                      }
+                      onPress={() => run(() => list(page - 1))}
                     />
                     <Text>{page}</Text>
                     <Button
                       title="Next"
                       secondary
-                      disabled={
-                        page * 20 >= total || busy
-                      }
-                      onPress={() =>
-                        run(() => list(page + 1))
-                      }
+                      disabled={page * 20 >= total || busy}
+                      onPress={() => run(() => list(page + 1))}
                     />
                   </View>
                 </>
@@ -933,22 +933,15 @@ export function AppStateProvider({
 
               {screen === "create" && selected && (
                 <>
-                  <Text style={s.h1}>
-                    Write your shopping list
-                  </Text>
-
+                  <Text style={s.h1}>Write your shopping list</Text>
                   <Text style={s.text}>
-                    For {selected.firstName}. Choose a
-                    covered market:
+                    For {selected.firstName}. Choose a covered market:
                   </Text>
 
                   {selected.markets.map((value) => (
                     <Button
                       key={value}
-                      title={
-                        (market === value ? "✓ " : "") +
-                        value
-                      }
+                      title={(market === value ? "✓ " : "") + value}
                       secondary
                       onPress={() => setMarket(value)}
                     />
@@ -959,12 +952,10 @@ export function AppStateProvider({
                     value={customer.name}
                     onChangeText={(value) =>
                       setCustomer((previous) => ({
-                        ...previous,
-                        name: value,
+                        ...previous, name: value,
                       }))
                     }
                   />
-
                   <Field
                     label="Email for quotes and your order ID"
                     keyboardType="email-address"
@@ -972,42 +963,34 @@ export function AppStateProvider({
                     value={customer.email}
                     onChangeText={(value) =>
                       setCustomer((previous) => ({
-                        ...previous,
-                        email: value,
+                        ...previous, email: value,
                       }))
                     }
                   />
-
                   <Field
                     label="WhatsApp number (+234…)"
                     keyboardType="phone-pad"
                     value={customer.phone}
                     onChangeText={(value) =>
                       setCustomer((previous) => ({
-                        ...previous,
-                        phone: value,
+                        ...previous, phone: value,
                       }))
                     }
                   />
-
                   <Field
                     label="Delivery address / location"
                     multiline
                     value={customer.address}
                     onChangeText={(value) =>
                       setCustomer((previous) => ({
-                        ...previous,
-                        address: value,
+                        ...previous, address: value,
                       }))
                     }
                   />
 
                   {items.map((item, i) => (
                     <Card key={i}>
-                      <Text style={s.h3}>
-                        Item {i + 1}
-                      </Text>
-
+                      <Text style={s.h3}>Item {i + 1}</Text>
                       <Field
                         label="Item name"
                         value={item.name}
@@ -1015,7 +998,6 @@ export function AppStateProvider({
                           editItem(i, "name", value)
                         }
                       />
-
                       <View style={s.row}>
                         <View style={{ flex: 1 }}>
                           <Field
@@ -1023,15 +1005,10 @@ export function AppStateProvider({
                             keyboardType="decimal-pad"
                             value={item.quantity}
                             onChangeText={(value) =>
-                              editItem(
-                                i,
-                                "quantity",
-                                value,
-                              )
+                              editItem(i, "quantity", value)
                             }
                           />
                         </View>
-
                         <View style={{ flex: 1 }}>
                           <Field
                             label="Unit (kg, bag, item…)"
@@ -1042,7 +1019,6 @@ export function AppStateProvider({
                           />
                         </View>
                       </View>
-
                       <Field
                         label="Estimated price per unit, ₦ (leave blank if unknown)"
                         keyboardType="decimal-pad"
@@ -1051,16 +1027,13 @@ export function AppStateProvider({
                           editItem(i, "price", value)
                         }
                       />
-
                       {items.length > 1 && (
                         <Button
                           title="Remove item"
                           secondary
                           onPress={() =>
                             setItems((previous) =>
-                              previous.filter(
-                                (_, index) => index !== i,
-                              ),
+                              previous.filter((_, index) => index !== i),
                             )
                           }
                         />
@@ -1074,54 +1047,44 @@ export function AppStateProvider({
                     onPress={() =>
                       setItems((previous) => [
                         ...previous,
-                        {
-                          name: "",
-                          quantity: "1",
-                          unit: "item",
-                          price: "",
-                        },
+                        { name: "", quantity: "1", unit: "item", price: "" },
                       ])
                     }
                   />
-
                   <Field
                     label="Notes / substitutions"
                     multiline
                     value={notes}
                     onChangeText={setNotes}
                   />
-
                   <Text style={s.small}>
-                    Submitting agrees to our terms.
-                    Complaints must be filed within 24 hours
-                    after the order is marked delivered.
+                    Submitting agrees to our terms. Complaints must
+                    be filed within 24 hours after the order is marked
+                    delivered.
                   </Text>
-
                   <Button
                     title="Submit order"
                     disabled={busy}
                     onPress={() =>
                       run(async () => {
-                        const data = await api<{
-                          orderKey: string;
-                        }>("/orders", "POST", {
-                          shopperId: selected._id,
-                          market,
-                          customer,
-                          items: items.map((item) => ({
-                            name: item.name,
-                            quantity: Number(
-                              item.quantity,
-                            ),
-                            unit: item.unit,
-                            estimatedUnitPrice:
-                              item.price
+                        const data = await api<{ orderKey: string }>(
+                          "/orders",
+                          "POST",
+                          {
+                            shopperId: selected._id,
+                            market,
+                            customer,
+                            items: items.map((item) => ({
+                              name: item.name,
+                              quantity: Number(item.quantity),
+                              unit: item.unit,
+                              estimatedUnitPrice: item.price.trim()
                                 ? toKobo(item.price)
                                 : null,
-                          })),
-                          notes,
-                        });
-
+                            })),
+                            notes,
+                          },
+                        );
                         setKey(data.orderKey);
                         await track(data.orderKey);
                       })
@@ -1132,52 +1095,32 @@ export function AppStateProvider({
 
               {screen === "track" && order && (
                 <>
-                  <Text style={s.h1}>
-                    Your order
-                  </Text>
-
-                  <Text selectable style={s.code}>
-                    {key}
-                  </Text>
-
+                  <Text style={s.h1}>Your order</Text>
+                  <Text selectable style={s.code}>{key}</Text>
                   <Button
                     title="Copy private order ID"
                     secondary
                     onPress={() =>
                       run(async () => {
                         await Clipboard.setStringAsync(key);
-                        Alert.alert(
-                          "Copied",
-                          "Keep this ID private.",
-                        );
+                        Alert.alert("Copied", "Keep this ID private.");
                       })
                     }
                   />
-
-                  <Text
-                    style={[
-                      s.badge,
-                      { marginTop: 15 },
-                    ]}
-                  >
+                  <Text style={[s.badge, { marginTop: 15 }]}>
                     {statusLabel(order.status)}
                   </Text>
-
                   <Button
                     title="Refresh progress"
                     secondary
                     disabled={busy}
                     onPress={() => run(refreshTracked)}
                   />
-
                   <OrderDetails order={order} />
 
                   {order.status === "quoted" && (
                     <Card>
-                      <Text style={s.h2}>
-                        Your quote is ready
-                      </Text>
-
+                      <Text style={s.h2}>Your quote is ready</Text>
                       <Button
                         title="Accept quote"
                         disabled={busy}
@@ -1188,29 +1131,25 @@ export function AppStateProvider({
                               "POST",
                               {
                                 accept: true,
-                                revision:
-                                  order.quoteRevision,
+                                revision: order.quoteRevision,
                                 reason: "",
                               },
                               key,
                             );
-
                             await refreshTracked();
                           })
                         }
                       />
-
                       <Field
                         label="Reason for rejecting"
                         multiline
                         value={reason}
                         onChangeText={setReason}
                       />
-
                       <Button
                         title="Reject quote"
                         secondary
-                        disabled={busy || !reason}
+                        disabled={busy || !reason.trim()}
                         onPress={() =>
                           run(async () => {
                             await api(
@@ -1218,13 +1157,11 @@ export function AppStateProvider({
                               "POST",
                               {
                                 accept: false,
-                                revision:
-                                  order.quoteRevision,
+                                revision: order.quoteRevision,
                                 reason,
                               },
                               key,
                             );
-
                             await refreshTracked();
                           })
                         }
@@ -1234,24 +1171,16 @@ export function AppStateProvider({
 
                   {order.status === "accepted" && (
                     <Card>
-                      <Text style={s.h2}>
-                        Pay securely
-                      </Text>
-
+                      <Text style={s.h2}>Pay securely</Text>
                       <Text style={s.small}>
-                        Complete payment in your browser,
-                        return to this order, and tap
-                        Check payment.
+                        Complete payment in your browser, return to
+                        this order, and tap Check payment.
                       </Text>
-
                       <Button
                         title="Pay with Paystack"
                         disabled={busy}
-                        onPress={() =>
-                          run(payWithPaystack)
-                        }
+                        onPress={() => run(payWithPaystack)}
                       />
-
                       <Button
                         title="Check payment"
                         secondary
@@ -1263,22 +1192,14 @@ export function AppStateProvider({
 
                   {order.status === "delivered" && (
                     <Card>
-                      <Text style={s.h2}>
-                        Delivery & complaints
-                      </Text>
-
+                      <Text style={s.h2}>Delivery & complaints</Text>
                       <Text style={s.text}>
-                        File a complaint within 24 hours
-                        after the delivered timestamp.
-                        Deadline:{" "}
+                        File a complaint within 24 hours after the
+                        delivered timestamp. Deadline:{" "}
                         {order.complaintDeadline
-                          ? new Date(
-                              order.complaintDeadline,
-                            ).toLocaleString()
-                          : "Check order details"}
-                        .
+                          ? new Date(order.complaintDeadline).toLocaleString()
+                          : "Check order details"}.
                       </Text>
-
                       <Button
                         title={
                           order.customerConfirmedAt
@@ -1286,91 +1207,64 @@ export function AppStateProvider({
                             : "Confirm I received my order"
                         }
                         secondary
-                        disabled={
-                          busy ||
-                          !!order.customerConfirmedAt
-                        }
+                        disabled={busy || !!order.customerConfirmedAt}
                         onPress={() =>
                           run(async () => {
                             await api(
-                              "/order/confirm-delivery",
-                              "POST",
-                              {},
-                              key,
+                              "/order/confirm-delivery", "POST", {}, key,
                             );
-
                             await refreshTracked();
                           })
                         }
                       />
-
                       <Field
                         label="Complaint subject"
                         value={complaint.subject}
                         onChangeText={(value) =>
                           setComplaint((previous) => ({
-                            ...previous,
-                            subject: value,
+                            ...previous, subject: value,
                           }))
                         }
                       />
-
                       <Field
                         label="Complaint details"
                         multiline
                         value={complaint.message}
                         onChangeText={(value) =>
                           setComplaint((previous) => ({
-                            ...previous,
-                            message: value,
+                            ...previous, message: value,
                           }))
                         }
                       />
-
                       <Button
                         title="Submit complaint ticket"
                         disabled={busy}
                         onPress={() =>
                           run(async () => {
                             await api(
-                              "/order/complaint",
-                              "POST",
-                              complaint,
-                              key,
+                              "/order/complaint", "POST", complaint, key,
                             );
-
                             Alert.alert(
                               "Complaint received",
                               "Our admin team will review your complaint.",
                             );
-
-                            setComplaint({
-                              subject: "",
-                              message: "",
-                            });
+                            setComplaint({ subject: "", message: "" });
                           })
                         }
                       />
                     </Card>
                   )}
 
-                  <Text style={s.h2}>
-                    Progress history
-                  </Text>
-
+                  <Text style={s.h2}>Progress history</Text>
                   {order.history.map((history, i) => (
                     <Card key={i}>
                       <Text style={s.h3}>
                         {statusLabel(history.status)}
                       </Text>
                       <Text style={s.small}>
-                        {new Date(
-                          history.at,
-                        ).toLocaleString()}
+                        {new Date(history.at).toLocaleString()}
                       </Text>
-                      <Text style={s.text}>
-                        {history.note}
-                      </Text>
+                      <Text style={s.text}>{history.note}</Text>
                     </Card>
                   ))}
                 </>
@@ -1378,10 +1272,7 @@ export function AppStateProvider({
 
               {screen === "login" && (
                 <>
-                  <Text style={s.h1}>
-                    Shopper login
-                  </Text>
-
+                  <Text style={s.h1}>Shopper login</Text>
                   <Field
                     label="Email"
                     keyboardType="email-address"
@@ -1390,8 +1281,23 @@ export function AppStateProvider({
                     onChangeText={setEmail}
                   />
 
+                  <View
+                    style={{
+                      flexDirection: "row",
+                      flexWrap: "wrap",
+                      justifyContent: "space-between",
+                      alignItems: "center",
+                      gap: 8,
+                      marginTop: 10,
+                    }}
+                  >
+                    <Text style={s.h3}>Password</Text>
+                    <Text style={s.small}>
+                      Password must be 12 characters or more.
+                    </Text>
+                  </View>
                   <Field
-                    label="Password"
+                    label="Enter your password"
                     secureTextEntry
                     value={password}
                     onChangeText={setPassword}
@@ -1399,14 +1305,14 @@ export function AppStateProvider({
 
                   <Button
                     title="Sign in"
-                    disabled={busy}
+                    disabled={busy || !sessionReady}
                     onPress={() =>
                       run(async () => {
                         const result = await api<{
                           token: string;
                           role: string;
                         }>("/login", "POST", {
-                          email,
+                          email: email.trim(),
                           password,
                         });
 
@@ -1419,56 +1325,39 @@ export function AppStateProvider({
                         await saveSession(result.token);
                         setHasSession(true);
                         setPassword("");
-
                         await dashboard();
                       })
                     }
                   />
-
                   <Button
                     title={
-                      forgot
-                        ? "Hide password reset"
-                        : "Forgot password?"
+                      forgot ? "Hide password reset" : "Forgot password?"
                     }
                     secondary
-                    onPress={() =>
-                      setForgot((previous) => !previous)
-                    }
+                    onPress={() => setForgot((previous) => !previous)}
                   />
 
                   {forgot && (
                     <Card>
-                      <Text style={s.h2}>
-                        Reset shopper password
-                      </Text>
-
+                      <Text style={s.h2}>Reset shopper password</Text>
                       <Text style={s.text}>
                         Use the email entered above.
                         A reset code expires in 10 minutes.
                       </Text>
-
                       <Button
                         title="Email reset code"
                         disabled={busy}
                         onPress={() =>
                           run(async () => {
-                            const result = await api<{
-                              message: string;
-                            }>(
+                            const result = await api<{ message: string }>(
                               "/password/request",
                               "POST",
-                              { email },
+                              { email: email.trim() },
                             );
-
-                            Alert.alert(
-                              "Password reset",
-                              result.message,
-                            );
+                            Alert.alert("Password reset", result.message);
                           })
                         }
                       />
-
                       <Field
                         label="Reset code"
                         value={resetCode}
@@ -1476,32 +1365,24 @@ export function AppStateProvider({
                         maxLength={6}
                         onChangeText={setResetCode}
                       />
-
                       <Text style={s.small}>
-                        Enter your new password of at least
-                        12 characters in the Password field
-                        above, then confirm below.
+                        Enter your new password of at least 12
+                        characters in the Password field above,
+                        then confirm below.
                       </Text>
-
                       <Button
                         title="Confirm new password"
                         disabled={busy}
                         onPress={() =>
                           run(async () => {
-                            await api(
-                              "/password/confirm",
-                              "POST",
-                              {
-                                email,
-                                code: resetCode,
-                                password,
-                              },
-                            );
-
+                            await api("/password/confirm", "POST", {
+                              email: email.trim(),
+                              code: resetCode,
+                              password,
+                            });
                             setForgot(false);
                             setResetCode("");
                             setPassword("");
-
                             Alert.alert(
                               "Password changed",
                               "Sign in with your new password.",
@@ -1516,14 +1397,11 @@ export function AppStateProvider({
 
               {screen === "register" && (
                 <>
-                  <Text style={s.h1}>
-                    Become a shopper
-                  </Text>
-
+                  <Text style={s.h1}>Become a shopper</Text>
                   <Text style={s.text}>
-                    Use your WhatsApp number. Our admin team
-                    will contact you by email or WhatsApp
-                    after reviewing your application.
+                    Use your WhatsApp number. Our admin team will
+                    contact you by email or WhatsApp after reviewing
+                    your application.
                   </Text>
 
                   {[
@@ -1531,37 +1409,25 @@ export function AppStateProvider({
                     ["firstName", "First name"],
                     ["otherNames", "Other names (optional)"],
                     ["email", "Email"],
-                    [
-                      "password",
-                      "Create password (12+ characters)",
-                    ],
+                    ["password", "Create password (12+ characters)"],
                     ["phone", "WhatsApp phone number"],
                     ["address", "Address"],
                     ["residence", "Residence"],
-                    [
-                      "markets",
-                      "Markets you cover, separated by commas",
-                    ],
+                    ["markets", "Markets you cover, separated by commas"],
                     ["shoppingFee", "Shopping fee, ₦"],
                   ].map(([field, label]) => (
                     <Field
                       key={field}
                       label={label}
-                      value={String(
-                        reg[field as keyof typeof reg],
-                      )}
+                      value={String(reg[field as keyof typeof reg])}
                       onChangeText={(value) =>
                         setReg((previous) => ({
-                          ...previous,
-                          [field]: value,
+                          ...previous, [field]: value,
                         }))
                       }
-                      secureTextEntry={
-                        field === "password"
-                      }
+                      secureTextEntry={field === "password"}
                       autoCapitalize={
-                        field === "email" ||
-                        field === "password"
+                        field === "email" || field === "password"
                           ? "none"
                           : "sentences"
                       }
@@ -1580,35 +1446,21 @@ export function AppStateProvider({
                   <Text style={s.small}>
                     Tip: enter markets around you.
                   </Text>
-
                   <Button
-                    title={
-                      "State: " +
-                      (reg.state || "Select state")
-                    }
+                    title={"State: " + (reg.state || "Select state")}
                     secondary
-                    onPress={() =>
-                      setShowStates(
-                        (previous) => !previous,
-                      )
-                    }
+                    onPress={() => setShowStates((previous) => !previous)}
                   />
-
                   {showStates &&
                     states.map((state) => (
                       <Pressable
                         key={state}
                         onPress={() => {
-                          setReg((previous) => ({
-                            ...previous,
-                            state,
-                          }));
+                          setReg((previous) => ({ ...previous, state }));
                           setShowStates(false);
                         }}
                       >
-                        <Text style={s.link}>
-                          {state}
-                        </Text>
+                        <Text style={s.link}>{state}</Text>
                       </Pressable>
                     ))}
 
@@ -1617,60 +1469,52 @@ export function AppStateProvider({
                     value={reg.ownsBusiness}
                     onChange={(value) =>
                       setReg((previous) => ({
-                        ...previous,
-                        ownsBusiness: value,
+                        ...previous, ownsBusiness: value,
                       }))
                     }
                   />
-
                   {reg.ownsBusiness && (
                     <Field
                       label="What products do you sell?"
                       value={reg.products}
                       onChangeText={(value) =>
                         setReg((previous) => ({
-                          ...previous,
-                          products: value,
+                          ...previous, products: value,
                         }))
                       }
                     />
                   )}
-
                   <Toggle
                     label="Willing to run errands for customers in local markets?"
                     value={reg.willing}
                     onChange={(value) =>
                       setReg((previous) => ({
-                        ...previous,
-                        willing: value,
+                        ...previous, willing: value,
                       }))
                     }
                   />
-
                   <Toggle
                     label="Willing to provide identification?"
                     value={reg.providesId}
                     onChange={(value) =>
                       setReg((previous) => ({
-                        ...previous,
-                        providesId: value,
+                        ...previous, providesId: value,
                       }))
                     }
                   />
 
                   {!reg.providesId ? (
                     <Text style={s.error}>
-                      Unfortunately, we cannot accept you
-                      without a means of identification.
+                      Unfortunately, we cannot accept you without a
+                      means of identification.
                     </Text>
                   ) : (
                     <>
                       <Text style={s.small}>
-                        Select a clear photo of your entire
-                        ID. All text must be readable.
-                        JPEG or PNG only, maximum 5 MB.
+                        Select a clear photo of your entire ID.
+                        All text must be readable. JPEG or PNG only,
+                        maximum 5 MB.
                       </Text>
-
                       <Button
                         title={
                           reg.identityFile
@@ -1689,12 +1533,10 @@ export function AppStateProvider({
                     value={reg.mobile}
                     onChange={(value) =>
                       setReg((previous) => ({
-                        ...previous,
-                        mobile: value,
+                        ...previous, mobile: value,
                       }))
                     }
                   />
-
                   <Button
                     title={
                       reg.profilePhoto
@@ -1707,28 +1549,20 @@ export function AppStateProvider({
                       run(() =>
                         photo((id) =>
                           setReg((previous) => ({
-                            ...previous,
-                            profilePhoto: id,
+                            ...previous, profilePhoto: id,
                           })),
                         ),
                       )
                     }
                   />
-
                   <Text style={s.small}>
-                    Your identity document is restricted to
-                    authorized admins. Your photo, markets
-                    and shopping fee become public only
-                    after approval and availability.
+                    Your identity document is restricted to authorized
+                    admins. Your photo, markets and shopping fee become
+                    public only after approval and availability.
                   </Text>
-
                   <Button
                     title="Submit application"
-                    disabled={
-                      busy ||
-                      !reg.providesId ||
-                      !reg.willing
-                    }
+                    disabled={busy || !reg.providesId || !reg.willing}
                     onPress={() =>
                       run(async () => {
                         if (!reg.profilePhoto) {
@@ -1736,36 +1570,24 @@ export function AppStateProvider({
                             "Please upload your profile picture.",
                           );
                         }
-
                         if (!reg.identityFile) {
                           throw new Error(
                             "Please upload an image of your ID.",
                           );
                         }
 
-                        const result = await api<{
-                          message: string;
-                        }>("/register", "POST", {
-                          ...reg,
-                          markets: reg.markets
-                            .split(",")
-                            .map((value) => value.trim())
-                            .filter(Boolean),
-                          shoppingFee: toKobo(
-                            reg.shoppingFee,
-                          ),
-                        });
-
-                        Alert.alert(
-                          "Application received",
-                          result.message,
+                        const result = await api<{ message: string }>(
+                          "/register",
+                          "POST",
+                          {
+                            ...reg,
+                            markets: parseMarkets(reg.markets),
+                            shoppingFee: toKobo(reg.shoppingFee),
+                          },
                         );
 
-                        setReg((previous) => ({
-                          ...previous,
-                          password: "",
-                        }));
-
+                        Alert.alert("Application received", result.message);
+                        setReg((previous) => ({ ...previous, password: "" }));
                         go("login");
                       })
                     }
@@ -1773,16 +1595,10 @@ export function AppStateProvider({
                 </>
               )}
 
-              {screen === "dashboard" && me && (
+              {screen === "dashboard" && hasSession && me && (
                 <>
-                  <Text style={s.h1}>
-                    Hello, {me.firstName}
-                  </Text>
-
-                  <Text style={s.badge}>
-                    {me.status?.toUpperCase()}
-                  </Text>
-
+                  <Text style={s.h1}>Hello, {me.firstName}</Text>
+                  <Text style={s.badge}>{me.status?.toUpperCase()}</Text>
                   {me.status !== "approved" && (
                     <Card>
                       <Text style={s.text}>
@@ -1794,10 +1610,7 @@ export function AppStateProvider({
 
                   <View style={s.tabs}>
                     {[
-                      "Orders",
-                      "Availability",
-                      "Earnings",
-                      "Announcements",
+                      "Orders", "Availability", "Earnings", "Announcements",
                     ].map((value) => (
                       <Button
                         key={value}
@@ -1820,22 +1633,17 @@ export function AppStateProvider({
                               "PATCH",
                               { available: value },
                             );
-
                             setMe((previous) =>
                               previous
-                                ? {
-                                    ...previous,
-                                    available: value,
-                                  }
+                                ? { ...previous, available: value }
                                 : previous,
                             );
                           })
                         }
                       />
-
                       <Text style={s.small}>
-                        You appear in Find a shopper only
-                        when approved and available.
+                        You appear in Find a shopper only when
+                        approved and available.
                       </Text>
                     </Card>
                   )}
@@ -1846,108 +1654,72 @@ export function AppStateProvider({
                         title="Refresh orders"
                         secondary
                         disabled={busy}
-                        onPress={() =>
-                          run(() => dashboard())
-                        }
+                        onPress={() => run(() => dashboard())}
                       />
-
+                      {!myOrders.length && (
+                        <Text style={s.text}>No orders on this page.</Text>
+                      )}
                       {myOrders.map((shopperOrder) => (
                         <Card key={shopperOrder._id}>
                           <Text style={s.badge}>
-                            {statusLabel(
-                              shopperOrder.status,
-                            )}
+                            {statusLabel(shopperOrder.status)}
                           </Text>
-
                           <Text style={s.h3}>
                             {shopperOrder.customer.name}
-                            {" · "}
-                            {shopperOrder.market}
+                            {" · "}{shopperOrder.market}
                           </Text>
-
                           <Text style={s.text}>
                             {shopperOrder.items.length}
-                            {" items · "}
-                            {shopperOrder.customer.address}
+                            {" items · "}{shopperOrder.customer.address}
                           </Text>
-
                           <Button
                             title="Open order"
                             onPress={() => {
                               setOrder(shopperOrder);
-
                               setPrices(
-                                shopperOrder.items.map(
-                                  (item, i) =>
-                                    String(
-                                      (
-                                        shopperOrder.quote
-                                          ?.unitPrices[i] ??
-                                        item.estimatedUnitPrice ??
-                                        0
-                                      ) / 100,
-                                    ),
+                                shopperOrder.items.map((item, i) =>
+                                  String(
+                                    (
+                                      shopperOrder.quote?.unitPrices[i] ??
+                                      item.estimatedUnitPrice ??
+                                      0
+                                    ) / 100,
+                                  ),
                                 ),
                               );
-
                               setTransport(
                                 String(
-                                  (
-                                    shopperOrder.quote
-                                      ?.transportFee || 0
-                                  ) / 100,
+                                  (shopperOrder.quote?.transportFee || 0) /
+                                    100,
                                 ),
                               );
-
                               setFee(
                                 String(
                                   (
-                                    shopperOrder.quote
-                                      ?.shoppingFee ??
+                                    shopperOrder.quote?.shoppingFee ??
                                     me.shoppingFee
                                   ) / 100,
                                 ),
                               );
-
-                              setNotes(
-                                shopperOrder.quote?.note ||
-                                  "",
-                              );
-
+                              setNotes(shopperOrder.quote?.note || "");
                               go("shopperOrder");
                             }}
                           />
                         </Card>
                       ))}
-
                       <View style={s.row}>
                         <Button
                           title="Previous"
                           secondary
-                          disabled={
-                            myPage === 1 || busy
-                          }
-                          onPress={() =>
-                            run(() =>
-                              dashboard(myPage - 1),
-                            )
-                          }
+                          disabled={myPage === 1 || busy}
+                          onPress={() => run(() => dashboard(myPage - 1))}
                         />
-
                         <Text>{myPage}</Text>
-
                         <Button
                           title="Next"
                           secondary
-                          disabled={
-                            myPage * 20 >= myTotal ||
-                            busy
-                          }
-                          onPress={() =>
-                            run(() =>
-                              dashboard(myPage + 1),
-                            )
-                          }
+                          disabled={myPage * 20 >= myTotal || busy}
+                          onPress={() => run(() => dashboard(myPage + 1))}
                         />
                       </View>
                     </>
@@ -1956,72 +1728,43 @@ export function AppStateProvider({
                   {tab === "Earnings" && (
                     <>
                       <Card>
-                        <Text style={s.h2}>
-                          Across all paid orders
-                        </Text>
-
+                        <Text style={s.h2}>Across all paid orders</Text>
                         <Text style={s.text}>
                           Orders: {earnings.orders}
-                          {"\n"}
-                          Shopping earnings after platform
-                          fees:{" "}
-                          {naira(
-                            earnings.shoppingEarnings,
-                          )}
-                          {"\n"}
-                          Settlement cleared:{" "}
-                          {naira(earnings.cleared)}
-                          {"\n"}
-                          Settlement pending:{" "}
-                          {naira(earnings.pending)}
+                          {"\n"}Shopping earnings after platform fees:{" "}
+                          {naira(earnings.shoppingEarnings)}
+                          {"\n"}Settlement cleared: {naira(earnings.cleared)}
+                          {"\n"}Settlement pending: {naira(earnings.pending)}
                         </Text>
                       </Card>
-
                       <Text style={s.text}>
-                        Platform fee for new quotes:{" "}
-                        {naira(platformFee)}. This is
-                        deducted from your settlement.
-                        Existing quotes keep their original
-                        fee.
+                        Platform fee for new quotes: {naira(platformFee)}.
+                        This is deducted from your settlement.
+                        Existing quotes keep their original fee.
                       </Text>
-
                       <Text style={s.small}>
-                        Settlement includes item costs and
-                        transport; it is not all profit.
-                        Records below reflect this page of
-                        orders.
+                        Settlement includes item costs and transport;
+                        it is not all profit. Records below reflect
+                        this page of orders.
                       </Text>
 
                       {myOrders
-                        .filter(
-                          (shopperOrder) =>
-                            shopperOrder.quote,
-                        )
+                        .filter((shopperOrder) => shopperOrder.quote)
                         .map((shopperOrder) => (
                           <Card key={shopperOrder._id}>
                             <Text style={s.h3}>
                               {shopperOrder.customer.name}
                             </Text>
-
                             <Text style={s.text}>
                               Customer total:{" "}
+                              {naira(shopperOrder.quote!.total)}
+                              {"\n"}Platform fee:{" "}
+                              {naira(shopperOrder.quote!.platformFee || 0)}
+                              {"\n"}Your settlement:{" "}
                               {naira(
-                                shopperOrder.quote!.total,
-                              )}
-                              {"\n"}
-                              Platform fee:{" "}
-                              {naira(
-                                shopperOrder.quote!
-                                  .platformFee || 0,
-                              )}
-                              {"\n"}
-                              Your settlement:{" "}
-                              {naira(
-                                shopperOrder.quote!
-                                  .shopperSettlement || 0,
+                                shopperOrder.quote!.shopperSettlement || 0,
                               )}
                             </Text>
-
                             <Text style={s.badge}>
                               {shopperOrder.payout
                                 ? "Settlement cleared"
@@ -2032,57 +1775,61 @@ export function AppStateProvider({
                     </>
                   )}
 
-                  {tab === "Announcements" &&
-                    announcements.map((announcement) => (
-                      <Card key={announcement._id}>
-                        <Text style={s.h3}>
-                          {announcement.title}
-                        </Text>
+                  {tab === "Announcements" && (
+                    <>
+                      {!announcements.length && (
                         <Text style={s.text}>
-                          {announcement.body}
+                          No announcements at the moment.
                         </Text>
-                      </Card>
-                    ))}
+                      )}
+                      {announcements.map((announcement) => (
+                        <Card key={announcement._id}>
+                          <Text style={s.h3}>{announcement.title}</Text>
+                          <Text style={s.text}>{announcement.body}</Text>
+                        </Card>
+                      ))}
+                    </>
+                  )}
 
                   <Button
-                    title="Profile & bank settings"
+                    title="Profile, markets & bank settings"
                     secondary
                     disabled={busy}
                     onPress={() => run(settings)}
                   />
-
                   <Button
                     title="Logout"
                     secondary
                     disabled={busy}
-                    onPress={() =>
-                      run(async () => {
-                        try {
-                          await api(
-                            "/logout",
-                            "POST",
-                            {},
-                          );
-                        } finally {
-                          await clearSession();
-                          setHasSession(false);
-                          setMe(null);
-                          go("home");
-                        }
-                      })
-                    }
+                    onPress={() => run(logout)}
                   />
                 </>
               )}
 
-              {screen === "shopperOrder" && order && (
+              {screen === "dashboard" &&
+                sessionReady && hasSession && !me && (
+                  <Card>
+                    <Text style={s.text}>
+                      Load your shopper dashboard to continue.
+                    </Text>
+                    <Button
+                      title="Load dashboard"
+                      disabled={busy}
+                      onPress={() => run(() => dashboard())}
+                    />
+                    <Button
+                      title="Logout"
+                      secondary
+                      disabled={busy}
+                      onPress={() => run(logout)}
+                    />
+                  </Card>
+                )}
+
+              {screen === "shopperOrder" && hasSession && order && (
                 <>
-                  <Text style={s.h1}>
-                    Order details
-                  </Text>
-
+                  <Text style={s.h1}>Order details</Text>
                   <OrderDetails order={order} />
-
                   <Button
                     title="Contact customer on WhatsApp"
                     secondary
@@ -2090,32 +1837,22 @@ export function AppStateProvider({
                       run(async () => {
                         await Linking.openURL(
                           "https://wa.me/" +
-                            order.customer.phone.replace(
-                              /\D/g,
-                              "",
-                            ),
+                            order.customer.phone.replace(/\D/g, ""),
                         );
                       })
                     }
                   />
 
-                  {[
-                    "new",
-                    "quoted",
-                    "quote_rejected",
-                  ].includes(order.status) && (
+                  {["new", "quoted", "quote_rejected"].includes(
+                    order.status,
+                  ) && (
                     <Card>
-                      <Text style={s.h2}>
-                        Cost this order
-                      </Text>
-
-                      {order.rejectionReason && (
+                      <Text style={s.h2}>Cost this order</Text>
+                      {!!order.rejectionReason && (
                         <Text style={s.error}>
-                          Rejected:{" "}
-                          {order.rejectionReason}
+                          Rejected: {order.rejectionReason}
                         </Text>
                       )}
-
                       {order.items.map((item, i) => (
                         <Field
                           key={i}
@@ -2124,43 +1861,34 @@ export function AppStateProvider({
                           value={prices[i] || ""}
                           onChangeText={(value) =>
                             setPrices((previous) =>
-                              previous.map(
-                                (price, index) =>
-                                  index === i
-                                    ? value
-                                    : price,
+                              previous.map((price, index) =>
+                                index === i ? value : price,
                               ),
                             )
                           }
                         />
                       ))}
-
                       <Field
                         label="Transport fee, ₦"
                         keyboardType="decimal-pad"
                         value={transport}
                         onChangeText={setTransport}
                       />
-
                       <Field
                         label="Shopping fee, ₦"
                         keyboardType="decimal-pad"
                         value={fee}
                         onChangeText={setFee}
                       />
-
                       <Text style={s.text}>
-                        Current platform deduction:{" "}
-                        {naira(platformFee)}
+                        Current platform deduction: {naira(platformFee)}
                       </Text>
-
                       <Field
                         label="Quote note"
                         multiline
                         value={notes}
                         onChangeText={setNotes}
                       />
-
                       <Button
                         title="Send quote"
                         disabled={busy}
@@ -2170,31 +1898,25 @@ export function AppStateProvider({
                               `/me/orders/${order._id}/quote`,
                               "POST",
                               {
-                                unitPrices:
-                                  prices.map(toKobo),
-                                transportFee:
-                                  toKobo(transport),
-                                shoppingFee:
-                                  toKobo(fee),
+                                unitPrices: prices.map(toKobo),
+                                transportFee: toKobo(transport),
+                                shoppingFee: toKobo(fee),
                                 note: notes,
                               },
                             );
-
                             await dashboard();
                           })
                         }
                       />
-
                       <Field
                         label="Cancellation reason"
                         value={reason}
                         onChangeText={setReason}
                       />
-
                       <Button
                         title="Cancel unaccepted order"
                         secondary
-                        disabled={busy || !reason}
+                        disabled={busy || !reason.trim()}
                         onPress={() =>
                           run(async () => {
                             await api(
@@ -2202,7 +1924,6 @@ export function AppStateProvider({
                               "POST",
                               { reason },
                             );
-
                             await dashboard();
                           })
                         }
@@ -2221,13 +1942,11 @@ export function AppStateProvider({
                             "POST",
                             { status: "shopping" },
                           );
-
                           await dashboard();
                         })
                       }
                     />
                   )}
-
                   {order.status === "shopping" && (
                     <Button
                       title="Mark delivered"
@@ -2239,40 +1958,57 @@ export function AppStateProvider({
                             "POST",
                             { status: "delivered" },
                           );
-
                           await dashboard();
                         })
                       }
                     />
                   )}
-
                   <Text style={s.small}>
-                    Only mark delivered after the customer
-                    receives the order. The 24-hour complaint
-                    window starts at that time.
+                    Only mark delivered after the customer receives
+                    the order. The 24-hour complaint window starts
+                    at that time.
                   </Text>
                 </>
               )}
 
-              {screen === "settings" && me && (
+              {screen === "settings" && hasSession && me && (
                 <>
-                  <Text style={s.h1}>
-                    Shopper settings
+                  <Text style={s.h1}>Shopper settings</Text>
+                  <Text style={s.text}>
+                    Changes require a code sent to {me.email}.
+                    Codes expire in 10 minutes.
                   </Text>
 
-                  <Text style={s.text}>
-                    Changes require a code sent to{" "}
-                    {me.email}. Codes expire in 10 minutes.
-                  </Text>
+                  <Card>
+                    <Text style={s.h2}>Markets you cover</Text>
+                    <Text style={s.small}>
+                      Edit your current markets or add more,
+                      separated by commas. Include only markets
+                      where you can shop and deliver.
+                    </Text>
+                    <Field
+                      label="Market names"
+                      multiline
+                      value={settingsMarkets}
+                      onChangeText={(value) => {
+                        setSettingsMarkets(value);
+                        invalidateSettingsCode();
+                      }}
+                    />
+                    <Text style={s.small}>
+                      Example: Wurukum Market, Modern Market,
+                      Wadata Market. Removing a market does not
+                      cancel existing orders. Changes are saved
+                      after email confirmation.
+                    </Text>
+                  </Card>
 
                   {me.bank && (
                     <Card>
                       <Text style={s.text}>
                         {me.bank.name}
-                        {"\n"}
-                        {me.bank.accountName}
-                        {"\n"}
-                        {me.bank.accountNumber}
+                        {"\n"}{me.bank.accountName}
+                        {"\n"}{me.bank.accountNumber}
                       </Text>
                     </Card>
                   )}
@@ -2281,9 +2017,11 @@ export function AppStateProvider({
                     label="Shopping fee, ₦"
                     keyboardType="decimal-pad"
                     value={settingsFee}
-                    onChangeText={setSettingsFee}
+                    onChangeText={(value) => {
+                      setSettingsFee(value);
+                      invalidateSettingsCode();
+                    }}
                   />
-
                   <Button
                     title={
                       newPhoto
@@ -2293,39 +2031,47 @@ export function AppStateProvider({
                     secondary
                     disabled={busy}
                     onPress={() =>
-                      run(() => photo(setNewPhoto))
+                      run(() =>
+                        photo((id) => {
+                          setNewPhoto(id);
+                          invalidateSettingsCode();
+                        }),
+                      )
                     }
                   />
 
                   <Field
                     label="Search bank name (optional bank change)"
                     value={bankSearch}
-                    onChangeText={setBankSearch}
+                    onChangeText={(value) => {
+                      setBankSearch(value);
+                      setBankCode("");
+                      setAccountName("");
+                      invalidateSettingsCode();
+                    }}
                   />
 
-                  {bankSearch !== "" &&
+                  {!!bankSearch &&
                     banks
                       .filter((bank) =>
-                        bank.name
-                          .toLowerCase()
-                          .includes(
-                            bankSearch.toLowerCase(),
-                          ),
+                        bank.name.toLowerCase().includes(
+                          bankSearch.toLowerCase(),
+                        ),
                       )
                       .slice(0, 12)
                       .map((bank) => (
                         <Button
                           key={bank.code}
                           title={
-                            (bank.code === bankCode
-                              ? "✓ "
-                              : "") + bank.name
+                            (bank.code === bankCode ? "✓ " : "") +
+                            bank.name
                           }
                           secondary
                           onPress={() => {
                             setBankCode(bank.code);
                             setBankSearch(bank.name);
                             setAccountName("");
+                            invalidateSettingsCode();
                           }}
                         />
                       ))}
@@ -2336,77 +2082,40 @@ export function AppStateProvider({
                     maxLength={10}
                     value={accountNumber}
                     onChangeText={(value) => {
-                      setAccountNumber(value);
+                      setAccountNumber(value.replace(/\D/g, ""));
                       setAccountName("");
+                      invalidateSettingsCode();
                     }}
                   />
-
                   <Button
                     title="Verify account name"
                     secondary
                     disabled={
-                      busy ||
-                      !bankCode ||
-                      accountNumber.length !== 10
+                      busy || !bankCode || accountNumber.length !== 10
                     }
                     onPress={() =>
                       run(async () => {
-                        const result = await api<{
-                          accountName: string;
-                        }>("/banks/resolve", "POST", {
-                          bankCode,
-                          accountNumber,
-                        });
-
-                        setAccountName(
-                          result.accountName,
+                        const result = await api<{ accountName: string }>(
+                          "/banks/resolve",
+                          "POST",
+                          { bankCode, accountNumber },
                         );
+                        setAccountName(result.accountName);
                       })
                     }
                   />
-
-                  {accountName !== "" && (
-                    <Text style={s.badge}>
-                      {accountName}
-                    </Text>
+                  {!!accountName && (
+                    <Text style={s.badge}>{accountName}</Text>
                   )}
 
                   <Button
                     title="Email a confirmation code"
                     disabled={
                       busy ||
+                      !settingsMarkets.trim() ||
                       (!!bankCode && !accountName)
                     }
-                    onPress={() =>
-                      run(async () => {
-                        await api(
-                          "/me/settings/request",
-                          "POST",
-                          {
-                            shoppingFee:
-                              toKobo(settingsFee),
-                            ...(newPhoto
-                              ? {
-                                  profilePhoto: newPhoto,
-                                }
-                              : {}),
-                            ...(bankCode
-                              ? {
-                                  bankCode,
-                                  accountNumber,
-                                }
-                              : {}),
-                          },
-                        );
-
-                        setOtpSent(true);
-
-                        Alert.alert(
-                          "Check your email",
-                          "Enter the code to apply these exact changes.",
-                        );
-                      })
-                    }
+                    onPress={() => run(requestSettingsCode)}
                   />
 
                   {otpSent && (
@@ -2418,10 +2127,9 @@ export function AppStateProvider({
                         value={otp}
                         onChangeText={setOtp}
                       />
-
                       <Button
                         title="Confirm changes"
-                        disabled={busy}
+                        disabled={busy || otp.length !== 6}
                         onPress={() =>
                           run(async () => {
                             await api(
@@ -2429,8 +2137,12 @@ export function AppStateProvider({
                               "POST",
                               { code: otp },
                             );
-
+                            invalidateSettingsCode();
                             await dashboard();
+                            Alert.alert(
+                              "Settings updated",
+                              "Your markets and requested profile changes have been saved.",
+                            );
                           })
                         }
                       />
@@ -2439,68 +2151,56 @@ export function AppStateProvider({
                 </>
               )}
 
+              {(screen === "settings" || screen === "shopperOrder") &&
+                sessionReady && hasSession && !me && (
+                  <Button
+                    title="Return to dashboard"
+                    disabled={busy}
+                    onPress={() => run(() => dashboard())}
+                  />
+                )}
+
               {screen === "terms" && (
                 <>
-                  <Text style={s.h1}>
-                    Terms & privacy
-                  </Text>
-
+                  <Text style={s.h1}>Terms & privacy</Text>
                   <Card>
-                    <Text style={s.h3}>
-                      Shopping and payment
-                    </Text>
+                    <Text style={s.h3}>Shopping and payment</Text>
                     <Text style={s.text}>
-                      A shopper quotes item costs, transport
-                      and their shopping fee. Review and
-                      accept the total before paying through
-                      Paystack. Payments are collected by the
-                      platform. Do not send money directly to
+                      A shopper quotes item costs, transport and their
+                      shopping fee. Review and accept the total before
+                      paying through Paystack. Payments are collected
+                      by the platform. Do not send money directly to
                       a shopper for an app order.
                     </Text>
-
-                    <Text style={s.h3}>
-                      Delivery and complaints
-                    </Text>
+                    <Text style={s.h3}>Delivery and complaints</Text>
                     <Text style={s.text}>
-                      The shopper updates order progress.
-                      You may confirm receipt. Complaints
-                      about products or service must be
-                      submitted from your order page within
-                      24 hours after the order is marked
-                      delivered. The app shows the exact
-                      deadline. The admin team reviews
-                      tickets; refunds require a review and
-                      are not automatic.
+                      The shopper updates order progress. You may
+                      confirm receipt. Complaints about products or
+                      service must be submitted from your order page
+                      within 24 hours after the order is marked
+                      delivered. The app shows the exact deadline.
+                      The admin team reviews tickets; refunds require
+                      a review and are not automatic.
                     </Text>
-
-                    <Text style={s.h3}>
-                      Privacy
-                    </Text>
+                    <Text style={s.h3}>Privacy</Text>
                     <Text style={s.text}>
-                      Your selected shopper receives your
-                      shopping list, name, email, WhatsApp
-                      number and address to fulfil the
-                      order. Your private order ID unlocks
-                      your order; keep it secret. Shopper
-                      identity documents are encrypted and
-                      restricted to authorized admins.
-                      Shoppers are listed only when approved
-                      and available.
+                      Your selected shopper receives your shopping
+                      list, name, email, WhatsApp number and address
+                      to fulfil the order. Your private order ID
+                      unlocks your order; keep it secret. Shopper
+                      identity documents are encrypted and restricted
+                      to authorized admins. Shoppers are listed only
+                      when approved and available.
                     </Text>
-
-                    <Text style={s.h3}>
-                      Shopper settlement
-                    </Text>
+                    <Text style={s.h3}>Shopper settlement</Text>
                     <Text style={s.text}>
                       A platform fee is deducted from shopper
-                      settlement. Final settlement can be
-                      recorded after the 24-hour delivery
-                      complaint window and resolution of open
-                      complaints. Bank changes require email
-                      confirmation. Administrators record
-                      completed transfers with a reference;
-                      the app does not transfer funds
-                      automatically.
+                      settlement. Final settlement can be recorded
+                      after the 24-hour delivery complaint window
+                      and resolution of open complaints. Bank changes
+                      require email confirmation. Administrators
+                      record completed transfers with a reference;
+                      the app does not transfer funds automatically.
                     </Text>
                   </Card>
                 </>
@@ -2518,92 +2218,61 @@ export function AppStateProvider({
 function OrderDetails({ order }: { order: Order }) {
   return (
     <Card>
-      <Text style={s.h3}>
-        {order.market}
-      </Text>
-
+      <Text style={s.h3}>{order.market}</Text>
       <Text style={s.text}>
         {order.customer.name}
-        {"\n"}
-        {order.customer.address}
-        {"\n"}
-        WhatsApp: {order.customer.phone}
-        {"\n"}
-        Email: {order.customer.email}
+        {"\n"}{order.customer.address}
+        {"\n"}WhatsApp: {order.customer.phone}
+        {"\n"}Email: {order.customer.email}
       </Text>
 
       {order.items.map((item, i) => (
-        <View
-          key={i}
-          style={{ paddingVertical: 8 }}
-        >
+        <View key={i} style={{ paddingVertical: 8 }}>
           <Text style={s.h3}>
             {item.name} · {item.quantity} {item.unit}
           </Text>
-
           <Text style={s.small}>
             Estimated unit price:{" "}
             {item.estimatedUnitPrice === null
               ? "Shopper to cost"
               : naira(item.estimatedUnitPrice)}
             {order.quote &&
-              ` · Quoted: ${naira(
-                order.quote.unitPrices[i],
-              )}`}
+              ` · Quoted: ${naira(order.quote.unitPrices[i])}`}
           </Text>
         </View>
       ))}
 
-      {order.notes && (
-        <Text style={s.text}>
-          Notes: {order.notes}
-        </Text>
+      {!!order.notes && (
+        <Text style={s.text}>Notes: {order.notes}</Text>
       )}
 
       {order.quote && (
         <>
           <View style={s.line} />
-
           <Text style={s.text}>
             Items: {naira(order.quote.itemsTotal)}
-            {"\n"}
-            Transport: {naira(order.quote.transportFee)}
-            {"\n"}
-            Shopping fee: {naira(order.quote.shoppingFee)}
+            {"\n"}Transport: {naira(order.quote.transportFee)}
+            {"\n"}Shopping fee: {naira(order.quote.shoppingFee)}
           </Text>
-
           <Text style={s.price}>
             Total: {naira(order.quote.total)}
           </Text>
-
-          <Text style={s.text}>
-            {order.quote.note}
-          </Text>
-
+          <Text style={s.text}>{order.quote.note}</Text>
           {order.quote.platformFee !== undefined && (
             <Text style={s.small}>
-              Platform deduction:{" "}
-              {naira(order.quote.platformFee)}
-              {" · "}
-              Your settlement:{" "}
-              {naira(
-                order.quote.shopperSettlement || 0,
-              )}
+              Platform deduction: {naira(order.quote.platformFee)}
+              {" · "}Your settlement:{" "}
+              {naira(order.quote.shopperSettlement || 0)}
             </Text>
           )}
         </>
       )}
 
-      {order.cancelReason && (
-        <Text style={s.error}>
-          Cancelled: {order.cancelReason}
-        </Text>
+      {!!order.cancelReason && (
+        <Text style={s.error}>Cancelled: {order.cancelReason}</Text>
       )}
-
-      {order.payout && (
-        <Text style={s.badge}>
-          Shopper settlement cleared
-        </Text>
+      {!!order.payout && (
+        <Text style={s.badge}>Shopper settlement cleared</Text>
       )}
     </Card>
   );

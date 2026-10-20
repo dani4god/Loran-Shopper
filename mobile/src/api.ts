@@ -4,22 +4,28 @@ import * as SecureStore from "expo-secure-store";
 
 export const API = (
   process.env.EXPO_PUBLIC_API_URL || "http://localhost:4000"
-)
-  .trim()
-  .replace(/\/+$/, "");
+).trim().replace(/\/+$/, "");
 
 const TOKEN_STORAGE_KEY = "loran_token";
 const ORDERS_STORAGE_KEY = "loran_orders";
 const MAX_UPLOAD_SIZE = 5 * 1024 * 1024;
 
 let token = "";
+let sessionVersion = 0;
+let sessionStorageTask: Promise<void> = Promise.resolve();
 
 type UploadKind = "photo" | "identity";
+type SessionExpiredListener = () => void;
 
-type UploadResponse = {
-  id?: unknown;
-  error?: unknown;
-};
+const sessionExpiredListeners =
+  new Set<SessionExpiredListener>();
+
+export class SessionExpiredError extends Error {
+  constructor() {
+    super("Your session expired. Please sign in again.");
+    this.name = "SessionExpiredError";
+  }
+}
 
 function debug(
   message: string,
@@ -40,10 +46,7 @@ function isRecord(
   );
 }
 
-function errorMessage(
-  data: unknown,
-  fallback: string,
-): string {
+function errorMessage(data: unknown, fallback: string): string {
   if (
     isRecord(data) &&
     typeof data.error === "string" &&
@@ -51,19 +54,12 @@ function errorMessage(
   ) {
     return data.error;
   }
-
   return fallback;
 }
 
-function parseResponse(
-  text: string,
-  status: number,
-): unknown {
+function parseResponse(text: string, status: number): unknown {
   if (!text.trim()) {
-    if (status >= 200 && status < 300) {
-      return null;
-    }
-
+    if (status >= 200 && status < 300) return null;
     throw new Error(
       `The server returned an empty response (HTTP ${status}).`,
     );
@@ -78,27 +74,102 @@ function parseResponse(
   }
 }
 
-export async function restoreSession(): Promise<boolean> {
-  token =
-    (await SecureStore.getItemAsync(TOKEN_STORAGE_KEY)) || "";
+function updateSessionStorage(
+  task: () => Promise<void>,
+): Promise<void> {
+  const next = sessionStorageTask.then(task, task);
+  sessionStorageTask = next.catch(() => undefined);
+  return next;
+}
 
+export function getSessionVersion(): number {
+  return sessionVersion;
+}
+
+export function hasSavedSession(): boolean {
   return Boolean(token);
 }
 
-export async function saveSession(
-  value: string,
-): Promise<void> {
-  if (!value.trim()) {
+export function onSessionExpired(
+  listener: SessionExpiredListener,
+): () => void {
+  sessionExpiredListeners.add(listener);
+  return () => {
+    sessionExpiredListeners.delete(listener);
+  };
+}
+
+export async function restoreSession(): Promise<boolean> {
+  const version = sessionVersion;
+  await sessionStorageTask;
+
+  const stored =
+    (await SecureStore.getItemAsync(TOKEN_STORAGE_KEY)) || "";
+
+  if (version === sessionVersion) token = stored;
+  return Boolean(token);
+}
+
+export async function saveSession(value: string): Promise<void> {
+  const normalized = value.trim();
+
+  if (!normalized) {
     throw new Error("The server returned an invalid session.");
   }
 
-  await SecureStore.setItemAsync(TOKEN_STORAGE_KEY, value);
-  token = value;
+  await updateSessionStorage(() =>
+    SecureStore.setItemAsync(TOKEN_STORAGE_KEY, normalized),
+  );
+
+  sessionVersion += 1;
+  token = normalized;
 }
 
 export async function clearSession(): Promise<void> {
   token = "";
-  await SecureStore.deleteItemAsync(TOKEN_STORAGE_KEY);
+  sessionVersion += 1;
+
+  await updateSessionStorage(() =>
+    SecureStore.deleteItemAsync(TOKEN_STORAGE_KEY),
+  );
+}
+
+async function expireSession(
+  rejectedToken: string,
+  rejectedVersion: number,
+): Promise<void> {
+  if (
+    !rejectedToken ||
+    token !== rejectedToken ||
+    sessionVersion !== rejectedVersion
+  ) {
+    return;
+  }
+
+  const clearing = clearSession();
+
+  for (const listener of sessionExpiredListeners) {
+    try {
+      listener();
+    } catch {
+      debug("Session expiration listener failed");
+    }
+  }
+
+  try {
+    await clearing;
+  } catch {
+    debug("Could not remove expired session from storage");
+  }
+}
+
+function isShopperSessionPath(path: string): boolean {
+  const pathname = path.split("?")[0];
+  return (
+    pathname === "/me" ||
+    pathname.startsWith("/me/") ||
+    pathname === "/announcements"
+  );
 }
 
 export async function api<T = unknown>(
@@ -107,20 +178,14 @@ export async function api<T = unknown>(
   body?: unknown,
   key?: string,
 ): Promise<T> {
-  const normalizedPath = path.startsWith("/")
-    ? path
-    : `/${path}`;
-
+  const normalizedPath = path.startsWith("/") ? path : `/${path}`;
   const url = `${API}/v1${normalizedPath}`;
-  const startedAt = Date.now();
-
-  // Exclude query parameters from logs.
   const loggedPath = normalizedPath.split("?")[0];
+  const startedAt = Date.now();
+  const requestToken = token;
+  const requestVersion = sessionVersion;
 
-  debug("Request started", {
-    method,
-    path: loggedPath,
-  });
+  debug("Request started", { method, path: loggedPath });
 
   let response: Response;
 
@@ -129,8 +194,8 @@ export async function api<T = unknown>(
       method,
       headers: {
         Accept: "application/json",
-        ...(token
-          ? { Authorization: `Bearer ${token}` }
+        ...(requestToken
+          ? { Authorization: `Bearer ${requestToken}` }
           : {}),
         ...(body !== undefined
           ? { "Content-Type": "application/json" }
@@ -160,26 +225,25 @@ export async function api<T = unknown>(
     elapsedMs: Date.now() - startedAt,
   });
 
+  if (
+    response.status === 401 &&
+    isShopperSessionPath(normalizedPath)
+  ) {
+    await expireSession(requestToken, requestVersion);
+    throw new SessionExpiredError();
+  }
+
   let responseText: string;
 
   try {
     responseText = await response.text();
   } catch {
-    debug("Response body could not be read", {
-      method,
-      path: loggedPath,
-      status: response.status,
-    });
-
     throw new Error(
       "The connection was interrupted while reading the server response. Please try again.",
     );
   }
 
-  const data = parseResponse(
-    responseText,
-    response.status,
-  );
+  const data = parseResponse(responseText, response.status);
 
   if (!response.ok) {
     debug("Request rejected by server", {
@@ -189,10 +253,7 @@ export async function api<T = unknown>(
     });
 
     throw new Error(
-      errorMessage(
-        data,
-        `Request failed (HTTP ${response.status}).`,
-      ),
+      errorMessage(data, `Request failed (HTTP ${response.status}).`),
     );
   }
 
@@ -213,21 +274,15 @@ function resolveMimeType(
   const mimeType = suppliedType.trim().toLowerCase();
 
   if (mimeType && mimeType !== "application/octet-stream") {
-    return mimeType === "image/jpg"
-      ? "image/jpeg"
-      : mimeType;
+    return mimeType === "image/jpg" ? "image/jpeg" : mimeType;
   }
 
-  const extension = name.split(".").pop()?.toLowerCase();
-
-  switch (extension) {
+  switch (name.split(".").pop()?.toLowerCase()) {
     case "jpg":
     case "jpeg":
       return "image/jpeg";
-
     case "png":
       return "image/png";
-
     default:
       return "";
   }
@@ -254,9 +309,7 @@ export async function upload(
   }
 
   const fallbackName =
-    mimeType === "image/png"
-      ? `${kind}.png`
-      : `${kind}.jpg`;
+    mimeType === "image/png" ? `${kind}.png` : `${kind}.jpg`;
 
   const fileName = name.trim() || fallbackName;
   const file = new File(uri);
@@ -266,18 +319,14 @@ export async function upload(
       "The selected image is unavailable. Please select it again.",
     );
   }
-
   if (file.size === 0) {
     throw new Error("The selected image is empty.");
   }
-
   if (file.size > MAX_UPLOAD_SIZE) {
     throw new Error("The image must be 5 MB or smaller.");
   }
 
   const form = new FormData();
-
-  // Keep private identity uploads separate from profile photos.
   form.append("kind", kind);
   form.append("file", file, fileName);
 
@@ -287,50 +336,30 @@ export async function upload(
     mimeType,
   });
 
-  // Let fetch generate the multipart Content-Type and boundary.
   const response = await expoFetch(`${API}/v1/uploads`, {
     method: "POST",
     headers: {
       Accept: "application/json",
-      ...(token
-        ? { Authorization: `Bearer ${token}` }
-        : {}),
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
     },
     body: form,
   });
 
-  const responseText = await response.text();
-
   const parsed = parseResponse(
-    responseText,
+    await response.text(),
     response.status,
   );
 
   if (!response.ok) {
-    debug("Image upload rejected", {
-      kind,
-      status: response.status,
-    });
-
     throw new Error(
-      errorMessage(
-        parsed,
-        `Upload failed (HTTP ${response.status}).`,
-      ),
+      errorMessage(parsed, `Upload failed (HTTP ${response.status}).`),
     );
   }
-
-  if (!isRecord(parsed)) {
-    throw new Error(
-      "The upload server returned an invalid response.",
-    );
-  }
-
-  const data: UploadResponse = parsed;
 
   if (
-    typeof data.id !== "string" ||
-    !/^[a-f0-9]{24}$/.test(data.id)
+    !isRecord(parsed) ||
+    typeof parsed.id !== "string" ||
+    !/^[a-f0-9]{24}$/.test(parsed.id)
   ) {
     throw new Error(
       "The upload server did not return a valid file ID.",
@@ -342,7 +371,7 @@ export async function upload(
     status: response.status,
   });
 
-  return data.id;
+  return parsed.id;
 }
 
 export function toKobo(value: string): number {
@@ -363,45 +392,35 @@ export function toKobo(value: string): number {
   return kobo;
 }
 
-export async function rememberOrder(
-  key: string,
-): Promise<void> {
+export async function rememberOrder(key: string): Promise<void> {
   const normalizedKey = key.trim().toUpperCase();
-
   if (!normalizedKey) return;
 
   const old = await recentOrders();
 
-  const updated = [
-    normalizedKey,
-    ...old.filter((value) => value !== normalizedKey),
-  ].slice(0, 10);
-
   await SecureStore.setItemAsync(
     ORDERS_STORAGE_KEY,
-    JSON.stringify(updated),
+    JSON.stringify(
+      [
+        normalizedKey,
+        ...old.filter((value) => value !== normalizedKey),
+      ].slice(0, 10),
+    ),
   );
 }
 
 export async function recentOrders(): Promise<string[]> {
-  const stored = await SecureStore.getItemAsync(
-    ORDERS_STORAGE_KEY,
-  );
-
+  const stored = await SecureStore.getItemAsync(ORDERS_STORAGE_KEY);
   if (!stored) return [];
 
   try {
     const parsed: unknown = JSON.parse(stored);
-
-    if (!Array.isArray(parsed)) {
-      return [];
-    }
-
-    return parsed.filter(
-      (value): value is string =>
-        typeof value === "string" &&
-        value.trim().length > 0,
-    );
+    return Array.isArray(parsed)
+      ? parsed.filter(
+          (value): value is string =>
+            typeof value === "string" && value.trim().length > 0,
+        )
+      : [];
   } catch {
     return [];
   }
@@ -418,7 +437,6 @@ export function statusLabel(status: string): string {
     delivered: "Delivered",
     cancelled: "Cancelled",
   };
-
   return labels[status] || status;
 }
 
