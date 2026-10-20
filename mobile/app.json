@@ -1,0 +1,35 @@
+{
+  "expo": {
+    "name": "loRan Shopper",
+    "slug": "loran-shopper",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.loran.shopper"
+    },
+    "android": {
+      "package": "com.loran.shopper"
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-secure-store",
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Select your shopper profile picture.",
+          "cameraPermission": false,
+          "microphonePermission": false
+        }
+      ],
+      "expo-router",
+      "expo-status-bar",
+      "expo-video"
+    ],
+    "scheme": "loranshopper"
+  }
+}

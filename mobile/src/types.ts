@@ -1,0 +1,53 @@
+export type Shopper = {
+  _id: string;
+  surname: string;
+  firstName: string;
+  otherNames?: string;
+  email?: string;
+  phone?: string;
+  address?: string;
+  residence?: string;
+  state: string;
+  markets: string[];
+  shoppingFee: number;
+  profilePhoto: string;
+  available?: boolean;
+  status?: string;
+  reviewReason?: string;
+  bank?: { name: string; accountName: string; accountNumber: string };
+};
+export type Item = {
+  name: string;
+  quantity: number;
+  unit: string;
+  estimatedUnitPrice: number | null;
+};
+export type Order = {
+  _id: string;
+  orderKey: string;
+  market: string;
+  customer: { name: string; email: string; phone: string; address: string };
+  items: Item[];
+  notes: string;
+  status: string;
+  quoteRevision: number;
+  quote?: {
+    unitPrices: number[];
+    itemsTotal: number;
+    total: number;
+    transportFee: number;
+    shoppingFee: number;
+    platformFee?: number;
+    shopperSettlement?: number;
+    note: string;
+  };
+  rejectionReason?: string;
+  cancelReason?: string;
+  deliveredAt?: string;
+  complaintDeadline?: string;
+  complaintStatus?: "open" | "resolved";
+  customerConfirmedAt?: string;
+  payout?: { status: string; reference?: string };
+  history: { status: string; at: string; note: string }[];
+  shopper?: Shopper;
+};
